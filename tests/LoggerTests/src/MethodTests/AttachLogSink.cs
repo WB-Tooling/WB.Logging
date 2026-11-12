@@ -132,4 +132,54 @@ public sealed class TheAttachLogSinkMethod
         // Assert
         logger.AsyncLogSinks.Should().BeEmpty(because: "disposing the returned IDisposable should detach the log sink.");
     }
+
+    [Test]
+    public async Task ShouldDetachOnlyTheSynchronousSinkWhoseAttachmentIsDisposed()
+    {
+        // Arrange
+        TestLogSink firstSink = new();
+        TestLogSink secondSink = new();
+        await using Logger logger = new("TestLogger");
+        IDisposable firstAttachment = logger.AttachLogSink(firstSink);
+        IDisposable secondAttachment = logger.AttachLogSink(secondSink);
+
+        // Act
+        firstAttachment.Dispose();
+
+        // Assert
+        logger.LogSinks.Should().ContainSingle().Which.Should().BeSameAs(secondSink);
+        logger.Log(LogLevel.Info, "remaining-sink");
+        await logger.FlushAsync().ConfigureAwait(false);
+        firstSink.ReceivedMessages.Should().BeEmpty();
+        secondSink.ReceivedMessages.Should().ContainSingle()
+            .Which.Payload.Should().Be("remaining-sink");
+
+        secondAttachment.Dispose();
+        logger.LogSinks.Should().BeEmpty();
+    }
+
+    [Test]
+    public async Task ShouldDetachOnlyTheAsyncSinkWhoseAttachmentIsDisposed()
+    {
+        // Arrange
+        TestAsyncLogSink firstSink = new();
+        TestAsyncLogSink secondSink = new();
+        await using Logger logger = new("TestLogger");
+        IDisposable firstAttachment = logger.AttachLogSink(firstSink);
+        IDisposable secondAttachment = logger.AttachLogSink(secondSink);
+
+        // Act
+        firstAttachment.Dispose();
+
+        // Assert
+        logger.AsyncLogSinks.Should().ContainSingle().Which.Should().BeSameAs(secondSink);
+        logger.Log(LogLevel.Info, "remaining-async-sink");
+        await logger.FlushAsync().ConfigureAwait(false);
+        firstSink.ReceivedMessages.Should().BeEmpty();
+        secondSink.ReceivedMessages.Should().ContainSingle()
+            .Which.Payload.Should().Be("remaining-async-sink");
+
+        secondAttachment.Dispose();
+        logger.AsyncLogSinks.Should().BeEmpty();
+    }
 }

@@ -7,11 +7,6 @@ internal sealed record LogMessage<TPayload> : ILogMessage<TPayload>
     where TPayload : notnull
 {
     // ┌─────────────────────────────────────────────────────────────────────────────┐
-    // │ Private Fields                                                              │
-    // └─────────────────────────────────────────────────────────────────────────────┘
-    private readonly List<string> senders = [];
-
-    // ┌─────────────────────────────────────────────────────────────────────────────┐
     // │ Public Properties                                                           │
     // └─────────────────────────────────────────────────────────────────────────────┘
 
@@ -22,7 +17,7 @@ internal sealed record LogMessage<TPayload> : ILogMessage<TPayload>
     public required DateTimeOffset Timestamp { get; init; }
     
     /// <inheritdoc/>
-    public IReadOnlyList<string> Senders => senders;
+    public required IReadOnlyList<string> Senders { get; init; }
 
     /// <inheritdoc/>
     public LogLevel? LogLevel { get; init; }
@@ -30,14 +25,4 @@ internal sealed record LogMessage<TPayload> : ILogMessage<TPayload>
     /// <inheritdoc/>
     object ILogMessage.Payload => Payload;
 
-    // ┌─────────────────────────────────────────────────────────────────────────────┐
-    // │ Public Methods                                                              │
-    // └─────────────────────────────────────────────────────────────────────────────┘
-
-    /// <summary>
-    /// Adds the <paramref name="sender"/> to the list of senders of this log message.
-    /// </summary>
-    /// <param name="sender">The sender to add.</param>
-    internal void AddSender(string sender)
-        => senders.Add(sender);
 }

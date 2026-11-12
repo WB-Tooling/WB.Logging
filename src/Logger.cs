@@ -26,18 +26,20 @@ public sealed class Logger : ILogger
     private readonly Channel<ILogMessage> logMessageQueue = Channel.CreateUnbounded<ILogMessage>(new UnboundedChannelOptions
     {
         SingleReader = true,
-        SingleWriter = true,
+        SingleWriter = false,
     });
 
     private readonly Task logMessageProcessingTask;
 
-    private readonly CancellationTokenSource cancellationTokenSource = new();
-
     private readonly ConcurrentBag<ILogger> childLoggers = [];
 
-    private readonly ConcurrentBag<ILogSink> logSinks = [];
+    private readonly ConcurrentDictionary<object, ILogSink> logSinks = new();
 
-    private readonly ConcurrentBag<IAsyncLogSink> asyncLogSinks = [];
+    private readonly ConcurrentDictionary<object, IAsyncLogSink> asyncLogSinks = new();
+
+    private readonly object lifecycleLock = new();
+
+    private TaskCompletionSource? disposalCompletion;
 
     private readonly LogMessageFilterPipeline logMessageFilterPipeline = new();
 
@@ -61,7 +63,7 @@ public sealed class Logger : ILogger
         Name = name ?? throw new ArgumentNullException(nameof(name));
 
         minimumLogLevelFilter = AddLogMessageFilter(logMessage => logMessage.LogLevel is null || logMessage.LogLevel >= MinimumLogLevel);
-        logMessageProcessingTask = ExecuteAsync(cancellationTokenSource.Token);
+        logMessageProcessingTask = ExecuteAsync();
     }
 
     // ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -85,11 +87,11 @@ public sealed class Logger : ILogger
 
     /// <inheritdoc/>
     public IReadOnlyList<ILogSink> LogSinks
-        => [.. logSinks];
+        => [.. logSinks.Values];
 
     /// <inheritdoc/>
     public IReadOnlyList<IAsyncLogSink> AsyncLogSinks
-        => [.. asyncLogSinks];
+        => [.. asyncLogSinks.Values];
 
     /// <inheritdoc/>
     public string Name { get; }
@@ -124,15 +126,150 @@ public sealed class Logger : ILogger
     // └─────────────────────────────────────────────────────────────────────────────┘
 
     /// <inheritdoc/>
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Design", "CA1031:Do not catch general exception types", Justification = "Disposal exceptions are propagated to every concurrent caller.")]
     public async ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref isDisposed, 1) == 1)
+        TaskCompletionSource completion;
+        bool dispose = false;
+        lock (lifecycleLock)
         {
-            return;
+            if (disposalCompletion is null)
+            {
+                disposalCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                Interlocked.Exchange(ref isDisposed, 1);
+                logMessageQueue.Writer.TryComplete();
+                dispose = true;
+            }
+
+            completion = disposalCompletion;
         }
 
-        await cancellationTokenSource.CancelAsync().ConfigureAwait(false);
-        cancellationTokenSource.Dispose();
+        if (dispose)
+        {
+            try
+            {
+                await DisposeCoreAsync().ConfigureAwait(false);
+                completion.SetResult();
+            }
+            catch (Exception exception)
+            {
+                completion.SetException(exception);
+            }
+        }
+
+        await completion.Task.ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    public async Task FlushAsync(CancellationToken cancellationToken = default)
+    {
+        FlushItem flushItem = new();
+
+        using IDisposable registration = cancellationToken.Register(flushItem.Cancel);
+
+        Enqueue(new LogMessage<FlushItem>
+        {
+            Timestamp = TimestampProvider.CurrentTimestamp,
+            Payload = flushItem,
+            Senders = Array.Empty<string>(),
+        });
+
+        Task completedTask = await Task.WhenAny(flushItem.Task, logMessageProcessingTask).ConfigureAwait(false);
+        if (completedTask == logMessageProcessingTask && !flushItem.Task.IsCompleted)
+        {
+            await logMessageProcessingTask.ConfigureAwait(false);
+            throw new InvalidOperationException("The logger stopped before the flush completed.");
+        }
+
+        await flushItem.Task.ConfigureAwait(false);
+
+        if (Parent is not null)
+        {
+            await Parent.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <inheritdoc/>
+    public void Log<TPayload>(LogLevel? logLevel, TPayload payload)
+        where TPayload : notnull
+    {
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
+
+        List<string> senders = [];
+        for (Logger? logger = this; logger is not null; logger = logger.parent)
+        {
+            senders.Add(logger.Name);
+        }
+
+        LogMessage<TPayload> logMessage = new()
+        {
+            Timestamp = TimestampProvider.CurrentTimestamp,
+            LogLevel = logLevel,
+            Payload = payload,
+            Senders = senders.AsReadOnly(),
+        };
+
+        for (Logger? logger = this; logger is not null; logger = logger.parent)
+        {
+            if (logLevel is not null && logLevel < logger.MinimumLogLevel)
+            {
+                break;
+            }
+
+            logger.Enqueue(logMessage);
+        }
+    }
+
+    /// <inheritdoc/>
+    public IDisposable AttachLogSink(ILogSink logSink)
+    {
+        ArgumentNullException.ThrowIfNull(logSink);
+        object registration = new();
+        lock (lifecycleLock)
+        {
+            ObjectDisposedException.ThrowIf(IsDisposed, this);
+            logSinks.TryAdd(registration, logSink);
+        }
+
+        return new DelegateDisposable(() => logSinks.TryRemove(registration, out _));
+    }
+
+    /// <inheritdoc/>
+    public IDisposable AttachLogSink(IAsyncLogSink logSink)
+    {
+        ArgumentNullException.ThrowIfNull(logSink);
+        object registration = new();
+        lock (lifecycleLock)
+        {
+            ObjectDisposedException.ThrowIf(IsDisposed, this);
+            asyncLogSinks.TryAdd(registration, logSink);
+        }
+
+        return new DelegateDisposable(() => asyncLogSinks.TryRemove(registration, out _));
+    }
+
+    /// <inheritdoc/>
+    public ILogger CreateChildLogger(string name)
+    {
+        lock (lifecycleLock)
+        {
+            ObjectDisposedException.ThrowIf(IsDisposed, this);
+            Logger childLogger = new(name, this);
+            childLoggers.Add(childLogger);
+            return childLogger;
+        }
+    }
+
+    /// <inheritdoc/>
+    public IDisposable AddLogMessageFilter(LogMessageFilter filter)
+        => logMessageFilterPipeline.Add(filter);
+
+    // ┌─────────────────────────────────────────────────────────────────────────────┐
+    // │ Private Methods                                                             │
+    // └─────────────────────────────────────────────────────────────────────────────┘
+
+    private async Task DisposeCoreAsync()
+    {
         await logMessageProcessingTask.ConfigureAwait(false);
 
         foreach (ILogger childLogger in childLoggers)
@@ -140,7 +277,7 @@ public sealed class Logger : ILogger
             await childLogger.DisposeAsync().ConfigureAwait(false);
         }
 
-        foreach (ILogSink logSink in logSinks)
+        foreach (ILogSink logSink in logSinks.Values)
         {
             if (logSink is IAsyncDisposable asyncDisposableLogSink)
             {
@@ -152,7 +289,7 @@ public sealed class Logger : ILogger
             }
         }
 
-        foreach (IAsyncLogSink asyncLogSink in asyncLogSinks)
+        foreach (IAsyncLogSink asyncLogSink in asyncLogSinks.Values)
         {
             if (asyncLogSink is IDisposable disposableLogSink)
             {
@@ -167,86 +304,21 @@ public sealed class Logger : ILogger
         minimumLogLevelFilter.Dispose();
     }
 
-    /// <inheritdoc/>
-    public async Task FlushAsync(CancellationToken cancellationToken = default)
+    private void Enqueue<TPayload>(LogMessage<TPayload> logMessage)
+        where TPayload : notnull
     {
-        FlushItem flushItem = new();
-
-        using IDisposable registration = cancellationToken.Register(flushItem.Cancel);
-
-        Log(null, flushItem);
-
-        await flushItem.Task.ConfigureAwait(false);
-
-        if (Parent is not null)
+        if (!logMessageQueue.Writer.TryWrite(logMessage))
         {
-            await Parent.FlushAsync(cancellationToken).ConfigureAwait(false);
+            ObjectDisposedException.ThrowIf(IsDisposed, this);
+            throw new InvalidOperationException("The logger is no longer processing messages.");
         }
     }
 
-    /// <inheritdoc/>
-    public void Log<TPayload>(LogLevel? logLevel, TPayload payload)
-        where TPayload : notnull
-    {
-        LogMessage<TPayload> logMessage = new()
-        {
-            Timestamp = TimestampProvider.CurrentTimestamp,
-            LogLevel = logLevel,
-            Payload = payload,
-        };
-
-        Log(logMessage);
-
-        parent?.Log(logMessage);
-    }
-
-    /// <inheritdoc/>
-    public IDisposable AttachLogSink(ILogSink logSink)
-    {
-        logSinks.Add(logSink);
-
-        return new DelegateDisposable(() => logSinks.TryTake(out _));
-    }
-
-    /// <inheritdoc/>
-    public IDisposable AttachLogSink(IAsyncLogSink logSink)
-    {
-        asyncLogSinks.Add(logSink);
-
-        return new DelegateDisposable(() => asyncLogSinks.TryTake(out _));
-    }
-
-    /// <inheritdoc/>
-    public ILogger CreateChildLogger(string name)
-    {
-        Logger childLogger = new(name, this);
-
-        childLoggers.Add(childLogger);
-
-        return childLogger;
-    }
-
-    /// <inheritdoc/>
-    public IDisposable AddLogMessageFilter(LogMessageFilter filter)
-        => logMessageFilterPipeline.Add(filter);
-
-    // ┌─────────────────────────────────────────────────────────────────────────────┐
-    // │ Private Methods                                                             │
-    // └─────────────────────────────────────────────────────────────────────────────┘
-
-    private void Log<TPayload>(LogMessage<TPayload> logMessage)
-        where TPayload : notnull
-    {
-        logMessage.AddSender(Name);
-
-        logMessageQueue.Writer.TryWrite(logMessage);
-    }
-
-    private async Task ExecuteAsync(CancellationToken cancellationToken)
+    private async Task ExecuteAsync()
     {
         try
         {
-            await foreach (ILogMessage logMessage in logMessageQueue.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            await foreach (ILogMessage logMessage in logMessageQueue.Reader.ReadAllAsync().ConfigureAwait(false))
             {
                 if (logMessage.Payload is FlushItem flushItem)
                 {
@@ -254,13 +326,14 @@ public sealed class Logger : ILogger
                 }
                 else if (logMessageFilterPipeline.IsMatch(logMessage))
                 {
-                    await DispatchAsync(logMessage, cancellationToken).ConfigureAwait(false);
+                    await DispatchAsync(logMessage, CancellationToken.None).ConfigureAwait(false);
                 }
             }
         }
-        catch (OperationCanceledException)
+        catch (Exception exception)
         {
-            // normal shutdown
+            logMessageQueue.Writer.TryComplete(exception);
+            throw;
         }
     }
 
@@ -300,8 +373,8 @@ public sealed class Logger : ILogger
     {
         ILogMessage<TPayload> typedLogMessage = (ILogMessage<TPayload>)logMessage;
 
-        Task[] tasks = [.. logSinks.Select(logSink => logSink.WriteSafeAsync(typedLogMessage)),
-            .. asyncLogSinks.Select(asyncLogSink => asyncLogSink.SubmitSafeAsync(typedLogMessage, cancellationToken))];
+        Task[] tasks = [.. logSinks.Values.Select(logSink => logSink.WriteSafeAsync(typedLogMessage)),
+            .. asyncLogSinks.Values.Select(asyncLogSink => asyncLogSink.SubmitSafeAsync(typedLogMessage, cancellationToken))];
 
         return Task.WhenAll(tasks);
     }

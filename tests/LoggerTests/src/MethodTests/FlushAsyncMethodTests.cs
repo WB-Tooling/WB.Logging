@@ -54,4 +54,20 @@ public sealed class TheFlushAsyncMethod
         // Assert
         await action.Should().ThrowAsync<OperationCanceledException>().ConfigureAwait(false);
     }
+
+    [Test]
+    public async Task ShouldThrowPromptlyWhenFlushingAfterDisposal()
+    {
+        // Arrange
+        Logger logger = new("TestLogger");
+        await logger.DisposeAsync().ConfigureAwait(false);
+
+        // Act
+        Task flushTask = logger.FlushAsync();
+
+        // Assert
+        flushTask.IsCompleted.Should().BeTrue(because: "a disposed logger must reject the flush instead of waiting for an unprocessed marker.");
+        Func<Task> action = async () => await flushTask.ConfigureAwait(false);
+        await action.Should().ThrowAsync<ObjectDisposedException>().ConfigureAwait(false);
+    }
 }
