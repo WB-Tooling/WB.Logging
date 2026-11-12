@@ -95,4 +95,49 @@ public sealed class TheMinimumLogLevelProperty
         // Assert
         childMinimumLogLevel.Should().Be(childLogLevel, because: "the child logger should override the minimum log level from the parent logger.");
     }
+
+    [Test]
+    public async Task ShouldFilterBelowMinimumLogLevelBeforeForwardingToParent()
+    {
+        // Arrange
+        TestLogSink parentSink = new();
+        await using Logger parentLogger = new("ParentLogger")
+        {
+            MinimumLogLevel = LogLevel.Info
+        };
+        Logger childLogger = (Logger)parentLogger.CreateChildLogger("ChildLogger");
+        childLogger.MinimumLogLevel = LogLevel.Warning;
+        parentLogger.AttachLogSink(parentSink);
+
+        // Act
+        childLogger.Log(LogLevel.Info, "filtered-at-child");
+        childLogger.Log(LogLevel.Warning, "accepted-at-child");
+        await childLogger.FlushAsync().ConfigureAwait(false);
+
+        // Assert
+        parentSink.LogMessages.Should().ContainSingle()
+            .Which.Payload.Should().Be("accepted-at-child");
+        parentSink.LogMessages.Should().OnlyContain(logMessage => logMessage.LogLevel == LogLevel.Warning);
+    }
+
+    [Test]
+    public async Task ShouldStopForwardingAtIntermediateMinimumLogLevel()
+    {
+        await using Logger root = new("Root") { MinimumLogLevel = LogLevel.Info };
+        Logger middle = (Logger)root.CreateChildLogger("Middle");
+        Logger leaf = (Logger)middle.CreateChildLogger("Leaf");
+        middle.MinimumLogLevel = LogLevel.Warning;
+        leaf.MinimumLogLevel = LogLevel.Info;
+        TestLogSink rootSink = new();
+        TestLogSink leafSink = new();
+        root.AttachLogSink(rootSink);
+        leaf.AttachLogSink(leafSink);
+
+        leaf.Log(LogLevel.Info, "filtered-at-middle");
+        await leaf.FlushAsync().ConfigureAwait(false);
+
+        leafSink.LogMessages.Should().ContainSingle()
+            .Which.Payload.Should().Be("filtered-at-middle");
+        rootSink.LogMessages.Should().BeEmpty();
+    }
 }

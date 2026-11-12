@@ -39,3 +39,4 @@ logger.LogError("This is an error message.");
 
 - Step 1: The `await using` statement in the example, ensures that the logger is properly disposed of after use, allowing it to flush any remaining log messages before the application exits.
 - Step 2: The `IDisposable` returned by `AttachConsole()` can be used to detach the console sink when it's no longer needed, preventing further log messages from being sent to the console.
+- Logging and flushing after disposal throw `ObjectDisposedException`. Dispose the logger only after producers have stopped.
