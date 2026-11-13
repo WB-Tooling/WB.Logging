@@ -10,7 +10,7 @@
        │ WB Packages                                                          │
        ╰──────────────────────────────────────────────────────────────────────╯ -->
   <ItemGroup>
-    <PackageVersion Include="WB.Logging.Base" Version="[1.0.0-preview.16, 2.0.0)" />
+    <PackageVersion Include="WB.Logging.Base" Version="[1.0.0, 2.0.0)" />
   </ItemGroup>
 
   <!-- ╭──────────────────────────────────────────────────────────────────────╮
